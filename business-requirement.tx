@@ -1,0 +1,123 @@
+# Build Prompt — Personal Finance & Asset Management Web App
+
+> Copy everything below the line into your coding agent (Claude Code, Cursor, etc.). It is written as an implementation brief. Fill in any `TODO` markers before running.
+
+---
+
+## Role & Objective
+
+You are a senior full-stack engineer. Build a **personal** (single-user, self-hosted) web application for managing my financial news feed and asset watchlists. This is a side project for my own daily use, not a multi-tenant product — keep auth minimal (single user / a single API token or basic auth is fine) and optimize for clarity, low operational overhead, and easy local + Docker deployment.
+
+Work incrementally: scaffold the project, get a vertical slice working end-to-end (one news source + one asset price + one FX rate), then expand. Commit logically. Write tests for the data-fetching and business logic, not for trivial CRUD.
+
+## Tech Stack
+
+- **Backend:** Python 3.12+, **FastAPI**, **SQLAlchemy 2.x** (async) + **Alembic** for migrations, **Pydantic v2** for schemas, **httpx** for outbound calls, `uv` for dependency management.
+- **Database:** **PostgreSQL 16**.
+- **Frontend:** **Next.js (App Router) + TypeScript**, with **TanStack Query** for client-side server state (handles the polling/caching of news and prices cleanly), **Tailwind CSS + shadcn/ui** for the UI. Treat the FastAPI service as the JSON API; Next.js is purely the frontend (a Next.js API route can act as a thin proxy/BFF for auth-token injection if convenient, but business logic stays in FastAPI).
+  - *Rationale:* file-based routing, first-class TypeScript, and a batteries-included setup; you can render the morning News page on the server (fast first paint) while keeping the interactive bits (refresh, read/unread, watchlist edits) as client components driven by TanStack Query.
+  - *Acceptable alternative if I want to stay all-Python and minimal:* server-rendered **Jinja2 + HTMX + Tailwind** instead of the Next.js stack. Pick Next.js unless I say otherwise.
+- **Scheduler / Cron:** **APScheduler** with a **SQLAlchemy job store backed by Postgres**, running as a **separate worker process** from the API (its own container/entrypoint) so that scaling API workers never duplicates jobs.
+  - *Rationale:* no extra broker/infra (unlike Celery+Redis), persistent jobs survive restarts, and hourly fetch jobs are well within its comfort zone.
+  - *Acceptable alternatives, in order:* (1) **system cron / Kubernetes CronJob** invoking a **Typer** CLI command (`app jobs fetch-news`, `app jobs refresh-prices`) — simplest and most explicit; (2) **Celery + Celery Beat + Redis** only if I later need retries, fan-out, and a task dashboard. Implement APScheduler now but structure the fetch logic as plain callable services + Typer commands so switching to cron/Celery later is trivial.
+
+## Functional Requirements
+
+### 1. News
+- A **News page** I open every morning to quickly scan headlines.
+- News is **filtered to only the topics I care about** — I configure a set of topics/keywords.
+- A **Watchlist of topics**: I can add/remove topics (e.g. "semiconductors", "AI infrastructure", "healthcare stocks", plus arbitrary keywords or tickers). The feed only shows items matching my watchlist topics.
+- Must **fetch/pull news from external sources** and store them.
+- **Fetch on a schedule, every hour**, using **free sources** (see Data Sources).
+- Each article: title, source, url, published_at, summary/snippet, matched topic(s). De-duplicate by URL/title hash. Mark read/unread; let me filter by topic and by read state; sort newest-first.
+
+### 2. Assets
+- An asset **management / watchlist page** to add and remove assets I'm tracking.
+- Must support asset types: **stock, ETF, gold, bond** (model `asset_type` as an enum and keep it extensible).
+- For each watchlist asset: symbol/identifier, name, asset_type, currency, optional notes. Show **latest price** and a small **price history / sparkline** where the source provides it.
+- Refresh prices on a schedule (reuse the scheduler; e.g. hourly or a few times a day for free-tier rate limits).
+
+### 3. FX Rates
+- Must support **THB** (Thai Baht). Track and display key pairs (at minimum **USD/THB**; ideally also EUR/THB, and any currency used by a watchlist asset → THB so I can see asset values in THB).
+- Fetch FX on a schedule from a free source. Store a short history.
+- When showing asset prices, optionally convert/display the THB equivalent using the latest stored FX rate.
+
+## Free Data Sources (use these; make the source layer pluggable behind interfaces)
+
+- **News (primary):** **RSS/Atom feeds** parsed with `feedparser` — unlimited and free. Use **Google News RSS** keyword queries (`https://news.google.com/rss/search?q=<topic>`) to power topic/keyword watchlists, plus a few curated finance feeds. Optionally add **Finnhub** or **GNews** free tier for structured company/market news. Design a `NewsSource` interface so feeds and APIs are interchangeable.
+- **Stocks / ETFs:** **yfinance** (Yahoo Finance) as primary for quotes + history. Fallbacks: **Finnhub** or **Alpha Vantage** free tier (mind their daily limits).
+- **Gold:** via yfinance — gold futures `GC=F` or the `GLD` ETF.
+- **Bonds:** **FRED API** (free key) for treasury yields, and/or yfinance for bond ETFs (e.g. `TLT`, `AGG`).
+- **FX (THB):** **exchangerate.host** or **Frankfurter** (ECB data, includes THB) — both free, no key. Fallback: yfinance pair `USDTHB=X`.
+
+Put all source choices and API keys in env/config. The app must run with **zero paid keys** using RSS + yfinance + exchangerate.host out of the box.
+
+## Suggested Data Model (adjust as needed)
+
+- `topics` — id, name, query/keywords, enabled, created_at.
+- `articles` — id, source, title, url (unique), summary, published_at, fetched_at, content_hash (dedupe), is_read.
+- `article_topics` — article_id ↔ topic_id (many-to-many of matched topics).
+- `assets` — id, symbol, name, asset_type (enum: stock|etf|gold|bond), currency, notes, enabled, created_at.
+- `prices` — id, asset_id, price, currency, as_of (timestamp), source. (Time-series; index on (asset_id, as_of).)
+- `fx_rates` — id, base_ccy, quote_ccy, rate, as_of, source.
+- `job_runs` — id, job_name, started_at, finished_at, status, items_processed, error (lightweight observability for the scheduled fetches).
+
+## Suggested API Surface (FastAPI, JSON)
+
+- `GET /api/news` — list articles; query params: `topic`, `is_read`, `limit`, `cursor`. `POST /api/news/{id}/read`.
+- `GET/POST/DELETE /api/topics` — manage topic watchlist.
+- `GET/POST/DELETE /api/assets` — manage asset watchlist.
+- `GET /api/assets/{id}/prices` — price history. `GET /api/assets/with-latest` — assets joined to latest price (+ THB value).
+- `GET /api/fx` — latest rates; `GET /api/fx/history`.
+- `POST /api/jobs/{name}/run` — manually trigger a fetch (handy for dev). `GET /api/jobs/runs` — recent run history.
+- `GET /healthz`.
+
+## Scheduling Design
+
+- Jobs: `fetch_news` (hourly), `refresh_prices` (hourly or N×/day), `refresh_fx` (hourly or daily).
+- Each job = a thin scheduler trigger calling a **service function** that is also exposed as a **Typer CLI command**. Record each run in `job_runs`. Make jobs idempotent and safe to re-run. Add basic retry/backoff on transient HTTP errors and respect source rate limits.
+
+## Project Structure (suggested)
+
+```
+backend/
+  app/
+    main.py                # FastAPI app factory
+    config.py              # pydantic-settings, env-driven
+    db.py                  # async engine/session
+    models/                # SQLAlchemy models
+    schemas/               # Pydantic schemas
+    api/                   # routers: news, topics, assets, fx, jobs
+    services/              # business logic (matching, conversion)
+    sources/               # pluggable fetchers: news/, prices/, fx/  (interface + impls)
+    jobs/                  # scheduler setup + job definitions
+    cli.py                 # Typer commands (jobs, db)
+  alembic/                 # migrations
+  tests/
+  pyproject.toml
+frontend/                  # Next.js (App Router) + TS app
+docker-compose.yml         # postgres + api + scheduler-worker (+ frontend in dev)
+Dockerfile(.api / .worker)
+.env.example
+README.md
+```
+
+## Non-Functional / Quality Bar
+
+- 12-factor config via `pydantic-settings`; ship a complete `.env.example`.
+- **Alembic** migrations from day one; no `create_all` in prod.
+- **docker-compose** that brings up Postgres, the API, and the scheduler worker with one command; document local dev (with hot reload) and the prod-ish compose path.
+- Structured logging; surface fetch failures in `job_runs` and logs.
+- Tests for: topic/keyword matching, dedupe, FX conversion, and each source adapter (mock HTTP with `respx`/`httpx` transport).
+- A clear `README` covering setup, env vars, running migrations, running jobs manually, and adding a new source.
+
+## Deliverables / Order of Work
+
+1. Scaffold backend + Postgres + Alembic + `.env.example` + docker-compose; `GET /healthz` green.
+2. Models + migrations for all tables above.
+3. **Vertical slice:** one RSS news source → `fetch_news` job → `GET /api/news`; one yfinance asset → `refresh_prices`; one exchangerate.host pair → `refresh_fx`. Wire APScheduler worker + Typer commands.
+4. Topic & asset watchlist CRUD + matching/dedup logic + tests.
+5. Next.js frontend: News page, Assets page (watchlist + latest price + sparkline + THB value), FX widget, Topics settings.
+6. Expand sources (Google News RSS per-topic, gold, bonds via FRED, more FX pairs), add `job_runs` history view, polish.
+
+Ask me before introducing any paid API or any dependency that needs a credit card. Otherwise proceed and show me the running vertical slice first.
